@@ -1,21 +1,18 @@
 use anyhow::{Context, Result};
-use server::{Message};
+use server::Message;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use uuid::Uuid;
 
-pub type MessageSender = mpsc::Sender<String>;
-pub type MessageReceiver = Arc<Mutex<mpsc::Receiver<Message>>>;
-
 #[derive(Clone)]
 pub struct Client {
-    message_sender: MessageSender,
-    message_receiver: MessageReceiver,
+    pub message_sender: Arc<Mutex<mpsc::Sender<String>>>,
+    pub message_receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
     pub client_id: Arc<Mutex<Option<Uuid>>>,
     _connection_handle: Arc<tokio::task::JoinHandle<()>>,
 }
@@ -25,21 +22,23 @@ impl Client {
         let rt = tokio::runtime::Handle::current();
         let address = address.to_string();
 
-        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel::<String>(100);
-        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<Message>(100);
+        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Message>(100);
 
         let client_id = Arc::new(Mutex::new(None));
         let client_id_clone = client_id.clone();
 
         let connection_handle = rt.spawn(async move {
-            if let Err(e) = Self::run_connection(&address, outgoing_rx, incoming_tx, client_id_clone).await {
+            if let Err(e) =
+                Self::run_connection(&address, outgoing_rx, incoming_tx, client_id_clone).await
+            {
                 eprintln!("Connection error: {}", e);
             }
         });
 
         Ok(Client {
             client_id,
-            message_sender: outgoing_tx,
+            message_sender: Arc::new(Mutex::new(outgoing_tx)),
             message_receiver: Arc::new(Mutex::new(incoming_rx)),
             _connection_handle: Arc::new(connection_handle),
         })
@@ -47,13 +46,11 @@ impl Client {
 
     pub async fn send_message(&self, message: &str) -> Result<()> {
         self.message_sender
+            .lock()
+            .await
             .send(message.to_string())
             .await
             .with_context(|| "Failed to send message")
-    }
-
-    pub async fn receive_message(&self) -> Option<Message> {
-        self.message_receiver.lock().await.recv().await
     }
 
     async fn run_connection(
@@ -120,7 +117,10 @@ impl Client {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
-                if Self::send_message_to_server(&mut write_stream, &message).await.is_err() {
+                if Self::send_message_to_server(&mut write_stream, &message)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

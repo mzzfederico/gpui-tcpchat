@@ -1,16 +1,16 @@
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fmt::{Display, Formatter, Result};
+use std::fmt::{Display, Formatter};
+use serde::{Deserialize, Serialize};
 use crate::chat::ClientId;
 
-
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
     pub client_id: ClientId,
     pub content: String,
     pub timestamp: i64,
 }
 
-impl ChatMessage {
+impl Message {
     pub fn new(client_id: ClientId, content: String) -> Self {
         Self {
             client_id,
@@ -23,8 +23,8 @@ impl ChatMessage {
     }
 }
 
-impl Display for ChatMessage {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+impl Display for Message {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "[{}] Client {}: {}", self.timestamp, self.client_id, self.content)
     }
 }

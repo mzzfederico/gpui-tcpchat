@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
-use server::{ChatMessage, ClientId};
+use server::{Message};
 use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 
 pub type MessageSender = mpsc::Sender<String>;
-pub type MessageReceiver = Arc<Mutex<mpsc::Receiver<ChatMessage>>>;
+pub type MessageReceiver = Arc<Mutex<mpsc::Receiver<Message>>>;
 
 #[derive(Clone)]
 pub struct Client {
@@ -20,8 +21,8 @@ impl Client {
         let rt = tokio::runtime::Handle::current();
         let address = address.to_string();
 
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
-        let (incoming_tx, incoming_rx) = mpsc::channel::<ChatMessage>(100);
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel::<String>(100);
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<Message>(100);
 
         let connection_handle = rt.spawn(async move {
             if let Err(e) = Self::run_connection(&address, outgoing_rx, incoming_tx).await {
@@ -43,17 +44,11 @@ impl Client {
             .with_context(|| "Failed to send message")
     }
 
-    pub fn send_message_blocking(&self, message: &str) -> Result<()> {
-        self.message_sender
-            .try_send(message.to_string())
-            .with_context(|| "Failed to send message")
-    }
-
-    pub async fn receive_message(&self) -> Option<ChatMessage> {
+    pub async fn receive_message(&self) -> Option<Message> {
         self.message_receiver.lock().await.recv().await
     }
 
-    pub fn try_receive_message(&self) -> Option<ChatMessage> {
+    pub fn try_receive_message(&self) -> Option<Message> {
         self.message_receiver
             .try_lock()
             .ok()?
@@ -64,7 +59,7 @@ impl Client {
     async fn run_connection(
         address: &str,
         outgoing_rx: mpsc::Receiver<String>,
-        incoming_tx: mpsc::Sender<ChatMessage>,
+        incoming_tx: mpsc::Sender<Message>,
     ) -> Result<()> {
         let stream = TcpStream::connect(address)
             .await
@@ -93,20 +88,26 @@ impl Client {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(message) = outgoing_rx.recv().await {
-                let formatted_message = format!("{}\n", message);
-                if write_stream.write_all(formatted_message.as_bytes()).await.is_err() {
-                    break;
-                }
-                if write_stream.flush().await.is_err() {
+                if Self::send_message_to_server(&mut write_stream, &message).await.is_err() {
                     break;
                 }
             }
         })
     }
 
+    async fn send_message_to_server(
+        writer: &mut tokio::io::WriteHalf<TcpStream>,
+        message: &String,
+    ) -> Result<()> {
+        let message_with_newline = format!("{}\n", message);
+        writer.write_all(message_with_newline.as_bytes()).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
     fn spawn_incoming_handler(
         read_stream: tokio::io::ReadHalf<TcpStream>,
-        incoming_tx: mpsc::Sender<ChatMessage>,
+        incoming_tx: mpsc::Sender<Message>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut reader = BufReader::new(read_stream);
@@ -118,62 +119,13 @@ impl Client {
                     Ok(0) => break, // Connection closed
                     Ok(_) => {
                         let message_text = line_buffer.trim();
-                        println!("Received raw message: '{}'", message_text);
-
-                        if !message_text.is_empty() {
-                            if let Some(chat_message) = Self::parse_server_message(message_text) {
-                                println!("Parsed message from {}: {}", chat_message.client_id, chat_message.content);
-                                if incoming_tx.send(chat_message).await.is_err() {
-                                    break; // Receiver dropped
-                                }
-                            } else {
-                                println!("Failed to parse message: '{}'", message_text);
-                            }
+                        if let Ok(message) = serde_json::from_str::<Message>(&message_text) {
+                            incoming_tx.send(message).await.ok();
                         }
                     }
                     Err(_) => break, // Connection error
                 }
             }
         })
-    }
-
-    fn parse_server_message(message: &str) -> Option<ChatMessage> {
-        // Expected format: "Client 123: hello world"
-        if !message.starts_with("Client ") {
-            return None;
-        }
-
-        let colon_pos = message.find(": ")?;
-        let client_id_str = &message[7..colon_pos]; // Skip "Client "
-        let content = &message[colon_pos + 2..];    // Skip ": "
-
-        let from_client_id = client_id_str.parse::<ClientId>().ok()?;
-
-        Some(ChatMessage::new(from_client_id, content.to_string()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_invalid_message() {
-        let message = "Invalid format";
-        let parsed = Client::parse_server_message(message);
-
-        assert!(parsed.is_none());
-    }
-
-    #[test]
-    fn test_parse_valid_message() {
-        let client_id = ClientId::new_v4();
-        let message = format!("Client {}: Hello world", client_id);
-        let parsed = Client::parse_server_message(&message);
-
-        assert!(parsed.is_some());
-        let chat_message = parsed.unwrap();
-        assert_eq!(chat_message.client_id, client_id);
-        assert_eq!(chat_message.content, "Hello world");
     }
 }

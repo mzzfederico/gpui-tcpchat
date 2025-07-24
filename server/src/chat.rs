@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -92,6 +92,7 @@ impl ChatInstance {
                     Ok(_) => {
                         let message_content = line_buffer.trim();
                         let message = Message::new(client_id, message_content.into());
+                        println!("Received message: {}", message.content);
                         let _ = broadcast_tx.send(message);
                     }
                     Err(_) => break,
@@ -108,6 +109,12 @@ impl ChatInstance {
         let mut broadcast_rx = self.broadcast.subscribe();
 
         tokio::spawn(async move {
+            let client_id_message = Message::new(Uuid::max(), client_id.to_string());
+
+            if Self::send_message_to_client(&mut client_tx, &client_id_message).await.is_err() {
+                return;
+            }
+
             loop {
                 if let Ok(message) = broadcast_rx.recv().await {
                     if message.client_id != client_id {

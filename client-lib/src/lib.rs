@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use server::{Message};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+
+use uuid::Uuid;
 
 pub type MessageSender = mpsc::Sender<String>;
 pub type MessageReceiver = Arc<Mutex<mpsc::Receiver<Message>>>;
@@ -13,6 +16,7 @@ pub type MessageReceiver = Arc<Mutex<mpsc::Receiver<Message>>>;
 pub struct Client {
     message_sender: MessageSender,
     message_receiver: MessageReceiver,
+    pub client_id: Arc<Mutex<Option<Uuid>>>,
     _connection_handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
@@ -24,13 +28,17 @@ impl Client {
         let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::channel::<String>(100);
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<Message>(100);
 
+        let client_id = Arc::new(Mutex::new(None));
+        let client_id_clone = client_id.clone();
+
         let connection_handle = rt.spawn(async move {
-            if let Err(e) = Self::run_connection(&address, outgoing_rx, incoming_tx).await {
+            if let Err(e) = Self::run_connection(&address, outgoing_rx, incoming_tx, client_id_clone).await {
                 eprintln!("Connection error: {}", e);
             }
         });
 
         Ok(Client {
+            client_id,
             message_sender: outgoing_tx,
             message_receiver: Arc::new(Mutex::new(incoming_rx)),
             _connection_handle: Arc::new(connection_handle),
@@ -48,18 +56,11 @@ impl Client {
         self.message_receiver.lock().await.recv().await
     }
 
-    pub fn try_receive_message(&self) -> Option<Message> {
-        self.message_receiver
-            .try_lock()
-            .ok()?
-            .try_recv()
-            .ok()
-    }
-
     async fn run_connection(
         address: &str,
         outgoing_rx: mpsc::Receiver<String>,
         incoming_tx: mpsc::Sender<Message>,
+        client_id: Arc<Mutex<Option<Uuid>>>,
     ) -> Result<()> {
         let stream = TcpStream::connect(address)
             .await
@@ -71,7 +72,7 @@ impl Client {
         let outgoing_task = Self::spawn_outgoing_handler(write_stream, outgoing_rx);
 
         // Spawn task to handle incoming messages
-        let incoming_task = Self::spawn_incoming_handler(read_stream, incoming_tx);
+        let incoming_task = Self::spawn_incoming_handler(read_stream, incoming_tx, client_id);
 
         // Wait for either task to complete
         tokio::select! {
@@ -80,6 +81,37 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    fn spawn_incoming_handler(
+        read_stream: tokio::io::ReadHalf<TcpStream>,
+        incoming_tx: mpsc::Sender<Message>,
+        client_id: Arc<Mutex<Option<Uuid>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(read_stream);
+            let mut line_buffer = String::new();
+
+            loop {
+                line_buffer.clear();
+                match reader.read_line(&mut line_buffer).await {
+                    Ok(0) => break, // Connection closed
+                    Ok(_) => {
+                        let message_text = line_buffer.trim();
+                        if let Ok(message) = serde_json::from_str::<Message>(&message_text) {
+                            if message.client_id == Uuid::max() {
+                                if let Ok(new_id) = Uuid::from_str(&message.content) {
+                                    *client_id.lock().await = Some(new_id);
+                                }
+                            } else {
+                                incoming_tx.send(message).await.ok();
+                            }
+                        }
+                    }
+                    Err(_) => break, // Connection error
+                }
+            }
+        })
     }
 
     fn spawn_outgoing_handler(
@@ -103,29 +135,5 @@ impl Client {
         writer.write_all(message_with_newline.as_bytes()).await?;
         writer.flush().await?;
         Ok(())
-    }
-
-    fn spawn_incoming_handler(
-        read_stream: tokio::io::ReadHalf<TcpStream>,
-        incoming_tx: mpsc::Sender<Message>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(read_stream);
-            let mut line_buffer = String::new();
-
-            loop {
-                line_buffer.clear();
-                match reader.read_line(&mut line_buffer).await {
-                    Ok(0) => break, // Connection closed
-                    Ok(_) => {
-                        let message_text = line_buffer.trim();
-                        if let Ok(message) = serde_json::from_str::<Message>(&message_text) {
-                            incoming_tx.send(message).await.ok();
-                        }
-                    }
-                    Err(_) => break, // Connection error
-                }
-            }
-        })
     }
 }

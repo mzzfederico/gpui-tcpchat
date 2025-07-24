@@ -8,3 +8,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 client-lib = { path = "../client-lib" }
 server = { path = "../server" }
+uuid = { workspace = true }
+gpui = { git = "https://github.com/zed-industries/zed" }
+unicode-segmentation = "1.12.0"

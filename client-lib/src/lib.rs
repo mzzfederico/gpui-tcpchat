@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use server::Message;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,7 +12,7 @@ use uuid::Uuid;
 pub struct Client {
     pub message_sender: Arc<Mutex<mpsc::Sender<String>>>,
     pub message_receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
-    pub client_id: Arc<Mutex<Option<Uuid>>>,
+    pub client_id: Uuid,
     _connection_handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
@@ -25,7 +24,7 @@ impl Client {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<String>(100);
         let (incoming_tx, incoming_rx) = mpsc::channel::<Message>(100);
 
-        let client_id = Arc::new(Mutex::new(None));
+        let client_id = Uuid::new_v4();
         let client_id_clone = client_id.clone();
 
         let connection_handle = rt.spawn(async move {
@@ -48,7 +47,7 @@ impl Client {
         self.message_sender
             .lock()
             .await
-            .send(message.to_string())
+            .send(message.into())
             .await
             .with_context(|| "Failed to send message")
     }
@@ -57,7 +56,7 @@ impl Client {
         address: &str,
         outgoing_rx: mpsc::Receiver<String>,
         incoming_tx: mpsc::Sender<Message>,
-        client_id: Arc<Mutex<Option<Uuid>>>,
+        client_id: Uuid,
     ) -> Result<()> {
         let stream = TcpStream::connect(address)
             .await
@@ -65,11 +64,12 @@ impl Client {
 
         let (read_stream, write_stream) = tokio::io::split(stream);
 
+
         // Spawn task to handle outgoing messages
-        let outgoing_task = Self::spawn_outgoing_handler(write_stream, outgoing_rx);
+        let outgoing_task = Self::spawn_outgoing_handler(write_stream, outgoing_rx, client_id);
 
         // Spawn task to handle incoming messages
-        let incoming_task = Self::spawn_incoming_handler(read_stream, incoming_tx, client_id);
+        let incoming_task = Self::spawn_incoming_handler(read_stream, incoming_tx);
 
         // Wait for either task to complete
         tokio::select! {
@@ -82,8 +82,7 @@ impl Client {
 
     fn spawn_incoming_handler(
         read_stream: tokio::io::ReadHalf<TcpStream>,
-        incoming_tx: mpsc::Sender<Message>,
-        client_id: Arc<Mutex<Option<Uuid>>>,
+        incoming_tx: mpsc::Sender<Message>
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut reader = BufReader::new(read_stream);
@@ -96,13 +95,7 @@ impl Client {
                     Ok(_) => {
                         let message_text = line_buffer.trim();
                         if let Ok(message) = serde_json::from_str::<Message>(&message_text) {
-                            if message.client_id == Uuid::max() {
-                                if let Ok(new_id) = Uuid::from_str(&message.content) {
-                                    *client_id.lock().await = Some(new_id);
-                                }
-                            } else {
-                                incoming_tx.send(message).await.ok();
-                            }
+                            incoming_tx.send(message).await.ok();
                         }
                     }
                     Err(_) => break, // Connection error
@@ -114,10 +107,16 @@ impl Client {
     fn spawn_outgoing_handler(
         mut write_stream: tokio::io::WriteHalf<TcpStream>,
         mut outgoing_rx: mpsc::Receiver<String>,
+        client_id: Uuid,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // Send authenticating message
+            if Self::send_message_to_server(&mut write_stream, Message::log(client_id)).await.is_err() {
+                return;
+            }
+
             while let Some(message) = outgoing_rx.recv().await {
-                if Self::send_message_to_server(&mut write_stream, &message)
+                if Self::send_message_to_server(&mut write_stream, Message::chat(client_id, message.as_str()))
                     .await
                     .is_err()
                 {
@@ -129,11 +128,13 @@ impl Client {
 
     async fn send_message_to_server(
         writer: &mut tokio::io::WriteHalf<TcpStream>,
-        message: &String,
+        message: Message,
     ) -> Result<()> {
-        let message_with_newline = format!("{}\n", message);
+        let json = serde_json::to_string(&message)?;
+        let message_with_newline = format!("{}\n", json);
         writer.write_all(message_with_newline.as_bytes()).await?;
         writer.flush().await?;
+        println!("Message sent: {}", message_with_newline);
         Ok(())
     }
 }

@@ -6,6 +6,7 @@ mod list;
 use anyhow::Result;
 use client_lib::Client;
 use gpui::*;
+use server::Message;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::{
@@ -51,8 +52,13 @@ fn spawn_message_handler(
     tokio::spawn(async move {
         loop {
             if let Some(message) = client.message_receiver.lock().await.recv().await {
-                println!("Message received: {}", message);
-                let _ = app_tx.send(message.content);
+                match message {
+                    Message::Chat { content, client_id: _, timestamp: _ } => {
+                        let _ = app_tx.send(content);
+                        continue;
+                    }
+                    _ => continue
+                }
             }
         }
     })
